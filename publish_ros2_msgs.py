@@ -7,7 +7,7 @@ from rclpy.node import Node
 import csv
 from scipy.spatial.transform import Rotation as R
 from cv_bridge import CvBridge
-from sensor_msgs.msg import Imu, Image, PointCloud2, PointField
+from sensor_msgs.msg import CameraInfo, Imu, Image, PointCloud2, PointField
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Quaternion, TransformStamped
 import numpy as np
@@ -155,6 +155,62 @@ def read_csv(file_path):
     return data
 
 
+def camera_intrinsics_from_odometry(row):
+    """Read fx, fy, cx, cy in full RGB pixels; distortion centers may be empty."""
+    if len(row) < 15:
+        raise ValueError(
+            "odometry.csv must contain pose data followed by fx, fy, cx, cy, "
+            "distortion_center_x, distortion_center_y"
+        )
+    intrinsics = tuple(float(value) for value in row[-6:-2])    # select only fx, fy, cx, cy
+    if not all(np.isfinite(value) for value in intrinsics):
+        raise ValueError("Camera intrinsics must be finite")
+    if intrinsics[0] <= 0 or intrinsics[1] <= 0:
+        raise ValueError("Camera focal lengths must be positive")
+    return intrinsics
+
+
+def create_camera_info(intrinsics, header, source_size, image_size):
+    """Build RGB or aligned-depth CameraInfo from full-resolution RGB intrinsics."""
+    fx, fy, cx, cy = intrinsics
+    source_width, source_height = source_size
+    width, height = image_size
+    scale_x, scale_y = width / source_width, height / source_height
+    fx, cx = fx * scale_x, cx * scale_x
+    fy, cy = fy * scale_y, cy * scale_y
+
+    msg = CameraInfo()
+    msg.header = header
+    msg.width = width
+    msg.height = height
+    msg.k = [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0]
+    msg.r = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]
+    msg.p = [fx, 0.0, cx, 0.0, 0.0, fy, cy, 0.0, 0.0, 0.0, 1.0, 0.0]
+    # CameraInfo has no distortion-center fields. These coordinates are NOT
+    # plumb_bob coefficients (k1, k2, t1, t2, k3). No model/coefficients are
+    # supplied by this CSV, so leave distortion unspecified.
+    msg.distortion_model = ""
+    msg.d = []
+    return msg
+
+
+def read_rgb_source_size(video_path, rgb_data):
+    """Get the original RGB size, independent of playback and RGB downsampling."""
+    cap = cv2.VideoCapture(video_path)
+    try:
+        success, frame = cap.read()
+        if success and frame is not None:
+            return (frame.shape[1], frame.shape[0])
+    finally:
+        cap.release()
+    # Allow playback from the original extracted images if video is unavailable.
+    for image_info in rgb_data:
+        frame = cv2.imread(image_info["path"])
+        if frame is not None:
+            return (frame.shape[1], frame.shape[0])
+    raise ValueError("Cannot determine full-resolution RGB size for depth intrinsics")
+
+
 def skew_symmetric(v):
     """
     Creates a skew-symmetric matrix from a vector.
@@ -179,14 +235,14 @@ def combine_and_sort_data(imu_data, odometry_data, rgb_data, depth_data, k=1):
     combined_data = []
 
     # Combine IMU data with skipping
-    for i, row in enumerate(imu_data[1:]):  # Skip header
+    for i, row in enumerate(imu_data):  # Header already removed by caller
         if i % k == 0:
             combined_data.append(
                 {"timestamp": float(row[0]), "type": "imu", "data": row}
             )
 
     # Combine Odometry data with skipping
-    for i, row in enumerate(odometry_data[1:]):  # Skip header
+    for i, row in enumerate(odometry_data):  # Header already removed by caller
         if i % k == 0:
             combined_data.append(
                 {"timestamp": float(row[0]), "type": "odometry", "data": row}
@@ -229,16 +285,17 @@ class StrayScannerDataPublisher(Node):
         self.imu_pub = self.create_publisher(Imu, "/imu", 100)
         self.odometry_pub = self.create_publisher(Odometry, "/odometry", 100)
         self.rgb_pub = self.create_publisher(Image, "/camera/rgb", 100)
-        self.depth_pub = self.create_publisher(Image, "/camera/depth", 100)
-        self.rgb_and_depth_pub = self.create_publisher(Image, "/camera/rgb_and_depth", 100)
-        self.pointcloud_pub_body = self.create_publisher(
-            PointCloud2, "/pointcloud_body", 100
+        self.rgb_camera_info_pub = self.create_publisher(
+            CameraInfo, "/camera/rgb/camera_info", 100
         )
-        self.pointcloud_pub_world = self.create_publisher(
-            PointCloud2, "/pointcloud_world", 100
+        self.depth_pub = self.create_publisher(Image, "/camera/depth", 100)
+        self.depth_camera_info_pub = self.create_publisher(
+            CameraInfo, "/camera/depth/camera_info", 100
         )
 
         self.tf_broadcaster = tf2_ros.TransformBroadcaster(self)
+        self.tf_static_broadcaster = tf2_ros.StaticTransformBroadcaster(self)
+        self.publish_static_transforms()
 
         # Load CSV data
         imu_data = read_csv(f"{data_dir}/imu.csv")[1:]  # Skip header
@@ -264,19 +321,7 @@ class StrayScannerDataPublisher(Node):
 
         # Prepare RGB data
         rgb_data = self.prepare_image_paths(self.rgb_dir, odometry_data)
-
-        # Prepare intrinsic matrix
-        camera_matrix_csv = f"{data_dir}/camera_matrix.csv"
-        if os.path.exists(camera_matrix_csv):
-            camera_matrix_data = read_csv(camera_matrix_csv)
-            self.rgb_intrinsic_matrix = np.array(camera_matrix_data, dtype=float)
-        else:
-            self.get_logger().error(
-                f"Camera matrix file not found: {camera_matrix_csv}"
-            )
-            raise FileNotFoundError(
-                f"Camera matrix file not found: {camera_matrix_csv}"
-            )
+        self.rgb_source_size = read_rgb_source_size(video_path, rgb_data)
 
         # pub option
         self.skip_frame_k = 1
@@ -297,6 +342,49 @@ class StrayScannerDataPublisher(Node):
         self.start_time = time.time()
         self.initial_timestamp = self.sorted_data[0]["timestamp"]
         self.timer = self.create_timer(0.001, self.publish_data)  # High frequency timer
+
+    def publish_static_transforms(self):
+        transforms = []
+
+        R_baselink_to_cam = np.array([
+            [0, 0, 1],
+            [-1, 0, 0],
+            [0, -1, 0],
+        ])
+        q = R.from_matrix(R_baselink_to_cam).as_quat()
+
+        tf_rgb = TransformStamped()
+        tf_rgb.header.stamp = self.get_clock().now().to_msg()
+        tf_rgb.header.frame_id = "base_link"
+        tf_rgb.child_frame_id = "camera_rgb_frame"
+
+        tf_rgb.transform.translation.x = 0.0
+        tf_rgb.transform.translation.y = 0.0
+        tf_rgb.transform.translation.z = 0.0
+
+        tf_rgb.transform.rotation.x = float(q[0])
+        tf_rgb.transform.rotation.y = float(q[1])
+        tf_rgb.transform.rotation.z = float(q[2])
+        tf_rgb.transform.rotation.w = float(q[3])
+
+        transforms.append(tf_rgb)
+
+        tf_depth = TransformStamped()
+        tf_depth.header.stamp = self.get_clock().now().to_msg()
+        tf_depth.header.frame_id = "camera_rgb_frame"
+        tf_depth.child_frame_id = "camera_depth_frame"
+
+        tf_depth.transform.translation.x = 0.0
+        tf_depth.transform.translation.y = 0.0
+        tf_depth.transform.translation.z = 0.0
+
+        tf_depth.transform.rotation.x = 0.0
+        tf_depth.transform.rotation.y = 0.0
+        tf_depth.transform.rotation.z = 0.0
+        tf_depth.transform.rotation.w = 1.0
+
+        transforms.append(tf_depth)
+        self.tf_static_broadcaster.sendTransform(transforms)
 
     def save_frames(self, video_path):
         cap = cv2.VideoCapture(video_path)
@@ -334,6 +422,7 @@ class StrayScannerDataPublisher(Node):
                             "timestamp": timestamp,
                             "depth_path": image_path,
                             "confidence_path": confidence_path,
+                            "intrinsics": camera_intrinsics_from_odometry(row),
                         }
                     )
             elif "confidence" in image_dir:
@@ -343,7 +432,11 @@ class StrayScannerDataPublisher(Node):
                 # For RGB images
                 image_path = os.path.join(image_dir, f"{frame_id:06d}.jpg")
                 if os.path.exists(image_path):
-                    image_data.append({"timestamp": timestamp, "path": image_path})
+                    image_data.append({
+                        "timestamp": timestamp,
+                        "path": image_path,
+                        "intrinsics": camera_intrinsics_from_odometry(row),
+                    })
         return image_data
 
     def publish_data(self):
@@ -409,7 +502,30 @@ class StrayScannerDataPublisher(Node):
                 T_cam_to_FLU = np.array(
                     [[0, 0, 1, 0], [1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 0, 1]]
                 )
-                pose_world = T_cam_to_FLU @ pose_body
+
+                T_world_to_FLU = np.array([
+                    [0, 0, 1, 0],
+                    [1, 0, 0, 0],
+                    [0, 1, 0, 0],
+                    [0, 0, 0, 1],
+                ])
+
+                # New: ROS FLU base_link expressed in ARKit camera axes.
+                T_arkit_cam_from_base = np.array([
+                    [ 0, -1,  0, 0],
+                    [ 0,  0,  -1, 0],
+                    [1,  0,  0, 0],
+                    [ 0,  0,  0, 1]
+                ], dtype=float)
+                
+                # pose_body is actually the raw ARKit camera pose.
+                pose_world = (
+                    T_world_to_FLU
+                    @ pose_body
+                    @ T_arkit_cam_from_base
+                )
+
+                #pose_world = T_cam_to_FLU @ pose_body
 
                 # Extract position
                 position_world = pose_world[:3, 3]
@@ -468,16 +584,22 @@ class StrayScannerDataPublisher(Node):
                     resized_img = cv2.resize(bgr_img, (width // 2, height // 2))
 
                     # 오른쪽으로 90도 회전
-                    rotated_img = cv2.rotate(resized_img, cv2.ROTATE_90_CLOCKWISE)
+                    #rotated_img = cv2.rotate(resized_img, cv2.ROTATE_90_CLOCKWISE)
+                    rotated_img = resized_img
 
                     img_msg = self.bridge.cv2_to_imgmsg(rotated_img, encoding="bgr8")
                     img_msg.header.stamp = rclpy.time.Time(seconds=timestamp).to_msg()
                     img_msg.header.frame_id = "camera_rgb_frame"
+                    camera_info_msg = create_camera_info(
+                        image_info["intrinsics"],
+                        img_msg.header,
+                        (width, height),
+                        (rotated_img.shape[1], rotated_img.shape[0]),
+                    )
                     self.rgb_pub.publish(img_msg)
+                    self.rgb_camera_info_pub.publish(camera_info_msg)
 
-                rgb_img = cv2.cvtColor(bgr_img, cv2.COLOR_BGR2RGB)
-
-            elif entry["type"] == "depth" and (self.pose_matrix is not None):
+            elif entry["type"] == "depth":
                 # Depth and Confidence Handling
                 image_info = entry["data"]
                 depth_img = cv2.imread(image_info["depth_path"], cv2.IMREAD_UNCHANGED)
@@ -491,91 +613,25 @@ class StrayScannerDataPublisher(Node):
                     and confidence_img is not None
                 ):
                     # Publish depth image
-                    rotated_depth_img = cv2.rotate(depth_img, cv2.ROTATE_90_CLOCKWISE)
-                    depth_msg = self.bridge.cv2_to_imgmsg(rotated_depth_img, encoding="mono16")
+                    #rotated_depth_img = cv2.rotate(depth_img, cv2.ROTATE_90_CLOCKWISE)
+                    rotated_depth_img = depth_img
+                    # Stray Scanner PNGs are uint16 depth in millimeters.
+                    depth_msg = self.bridge.cv2_to_imgmsg(rotated_depth_img, encoding="16UC1")
                     depth_msg.header.stamp = rclpy.time.Time(seconds=timestamp).to_msg()
                     depth_msg.header.frame_id = "camera_depth_frame"
+                    # ARKit sceneDepth is aligned to the RGB camera. Scale the
+                    # original per-frame K directly to depth dimensions, never
+                    # using the already downsampled RGB CameraInfo as the source.
+                    # https://github.com/strayrobots/scanner/blob/main/scripts/integrate.py
+                    depth_info_msg = create_camera_info(
+                        image_info["intrinsics"],
+                        depth_msg.header,
+                        self.rgb_source_size,
+                        (rotated_depth_img.shape[1], rotated_depth_img.shape[0]),
+                    )
                     self.depth_pub.publish(depth_msg)
+                    self.depth_camera_info_pub.publish(depth_info_msg)
 
-                    # 
-                    # publish rgb and depth combined image 
-                    # 
-                    # Resize RGB to match Depth's dimensions
-                    resized_rgb_img = cv2.resize(rotated_img, (rotated_depth_img.shape[1], rotated_depth_img.shape[0]))
-
-                    # Normalize Depth image to 8-bit for concatenation
-                    normalized_depth_img = cv2.normalize(rotated_depth_img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-                    # Convert grayscale depth image to 3 channels for concatenation with RGB
-                    depth_img_3channel = cv2.cvtColor(normalized_depth_img, cv2.COLOR_GRAY2BGR)
-
-                    # Concatenate RGB and Depth images horizontally
-                    combined_img = cv2.hconcat([resized_rgb_img, depth_img_3channel])
-
-                    # Convert combined image to ROS Image message
-                    rgb_and_depth_msg = self.bridge.cv2_to_imgmsg(combined_img, encoding="bgr8")
-                    rgb_and_depth_msg.header.stamp = rclpy.time.Time(seconds=timestamp).to_msg()
-                    rgb_and_depth_msg.header.frame_id = "camera_combined_frame"
-
-                    # Publish the combined image
-                    self.rgb_and_depth_pub.publish(rgb_and_depth_msg)
-
-                    # 
-                    # publish colored point cloud 
-                    # 
-                    # Adjust RGB image and camera matrix
-
-                    mask = (confidence_img == 1) | (confidence_img == 2)
-
-                    resized_rgb, adjusted_camera_matrix = adjust_rgb_and_camera_matrix(
-                        rgb_img, depth_img, self.rgb_intrinsic_matrix
-                    )
-                    points_with_rgb = unproject_depth(
-                        depth_img, resized_rgb, adjusted_camera_matrix, mask=mask
-                    )
-
-                    if points_with_rgb.size > 0:
-                        # Convert points to PointCloud2 message
-                        pointcloud_msg = create_pointcloud2(points_with_rgb, "body")
-                        pointcloud_msg.header.stamp = (
-                            depth_msg.header.stamp
-                        )  # Sync with depth image
-                        self.pointcloud_pub_body.publish(pointcloud_msg)
-
-                        # using the frame pose, pub within world
-                        # Convert points to PointCloud2 message
-                        points_with_rgb_world = points_with_rgb.copy()
-
-                        # body to world
-                        points_xyz = points_with_rgb_world[:, :3]
-                        points_xyz_local_homg = np.hstack(
-                            (points_xyz, np.ones((points_xyz.shape[0], 1)))
-                        )
-                        points_xyz_world_homg = (
-                            self.pose_matrix @ points_xyz_local_homg.T
-                        ).T
-
-                        # reset with the transformed cloud
-                        points_with_rgb_world[:, :3] = points_xyz_world_homg[:, :3]
-
-                        # for the lightweight visualization
-                        world_cloud_skip_k = 100
-                        points_with_rgb_world_skip_k = points_with_rgb_world[
-                            ::world_cloud_skip_k
-                        ]
-
-                        pointcloud_world_msg = create_pointcloud2(
-                            points_with_rgb_world_skip_k, "odom_frame"
-                        )
-                        pointcloud_world_msg.header.stamp = (
-                            depth_msg.header.stamp
-                        )  # Sync with depth image
-                        self.pointcloud_pub_world.publish(pointcloud_world_msg)
-
-                    else:
-                        self.get_logger().info(
-                            f"No valid points with confidence=0 in frame {self.current_index}."
-                        )
                 else:
                     self.get_logger().warn(
                         f"Depth or confidence image missing or invalid for frame {self.current_index}."
